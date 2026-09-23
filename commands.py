@@ -482,6 +482,29 @@ def _explain_math_command(command):
     return calculator.try_calculate(command)
 
 
+# ------------------------------------------------------------------
+# CONFIRMATION SAFETY (set by orion.py so destructive actions ask first)
+# ------------------------------------------------------------------
+
+_confirm_callback = None
+
+
+def set_confirm_callback(callback):
+    """Accept a callable(prompt) -> bool used before destructive actions."""
+    global _confirm_callback
+    _confirm_callback = callback
+
+
+def confirm(prompt):
+    if _confirm_callback is None:
+        return True
+    try:
+        return bool(_confirm_callback(prompt))
+    except Exception as error:
+        print("CONFIRM ERROR:", error)
+        return False
+
+
 # ============================================================
 # MAIN DISPATCHER
 # ============================================================
@@ -632,22 +655,28 @@ def execute_command(command):
         set_volume("mute")
         return "Muted"
 
-    # ---------------- System power ----------------
+    # ---------------- System power (with confirmation) ----------------
     if "lock" in command and "pc" in command:
         lock_pc()
         return "Locking your PC"
 
     if "shutdown" in command and "pc" in command:
-        shutdown_pc()
-        return "Shutting down in 5 seconds"
+        if confirm("Shutting down your PC. Are you sure? Say yes to confirm."):
+            shutdown_pc()
+            return "Shutting down in 5 seconds"
+        return "Okay, I won't shut down."
 
     if "restart" in command and "pc" in command:
-        restart_pc()
-        return "Restarting in 5 seconds"
+        if confirm("Restarting your PC. Are you sure? Say yes to confirm."):
+            restart_pc()
+            return "Restarting in 5 seconds"
+        return "Okay, I won't restart."
 
     if "sleep" in command and "pc" in command:
-        sleep_pc()
-        return "Putting your PC to sleep"
+        if confirm("Putting your PC to sleep. Are you sure? Say yes to confirm."):
+            sleep_pc()
+            return "Putting your PC to sleep"
+        return "Okay, I won't put the PC to sleep."
 
     # ---------------- Time / date ----------------
     if "what time" in command or "current time" in command or "the time" in command:
@@ -655,6 +684,15 @@ def execute_command(command):
 
     if "what date" in command or "today's date" in command:
         return tell_date()
+
+    # ---------------- New-generation tool phrases ----------------
+    try:
+        from tools import voice_command
+        handled = voice_command(command)
+        if handled:
+            return handled
+    except Exception as error:
+        print("VOICE TOOL ERROR:", error)
 
     return None
 

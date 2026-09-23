@@ -22,7 +22,12 @@ TEXT_EXTENSIONS = [
     ".sh", ".bat", ".ps1", ".ipynb", ".rst", ".rtf", ".srt", ".vtt",
 ]
 
+DOC_EXTENSIONS = [".pdf", ".docx", ".xlsx", ".pptx"]
+
+ALL_EXTENSIONS = TEXT_EXTENSIONS + DOC_EXTENSIONS
+
 MAX_READ_CHARS = 1600  # keep spoken output reasiliently short
+NOTES_DIR = os.path.join(winfolders.documents(), "OrionNotes")
 
 
 def find_file(name):
@@ -43,7 +48,7 @@ def find_file(name):
         if base.is_file():
             return base
         if not base.suffix:
-            for ext in TEXT_EXTENSIONS:
+            for ext in ALL_EXTENSIONS:
                 if (base.with_suffix(ext)).is_file():
                     return base.with_suffix(ext)
 
@@ -52,7 +57,7 @@ def find_file(name):
             continue
 
         for variant in variants:
-            for ext in TEXT_EXTENSIONS:
+            for ext in ALL_EXTENSIONS:
                 exact = directory / f"{variant}{ext}"
                 if exact.is_file():
                     return exact
@@ -108,6 +113,76 @@ def _strip_markup(content):
     return content
 
 
+def read_document(path):
+    """Read any supported document (text, PDF, Word, Excel) into plain text."""
+    suffix = Path(path).suffix.lower()
+    try:
+        if suffix == ".pdf":
+            return _read_pdf(path)
+        if suffix == ".docx":
+            return _read_docx(path)
+        if suffix == ".xlsx":
+            return _read_xlsx(path)
+        if suffix == ".pptx":
+            return _read_pptx(path)
+        return read_text_file(path)
+    except Exception as error:
+        print("DOCUMENT READ ERROR:", error)
+        return None
+
+
+def _read_pdf(path):
+    from pypdf import PdfReader
+    reader = PdfReader(str(path))
+    pages = []
+    for page in reader.pages[:12]:
+        text = page.extract_text() or ""
+        pages.append(text)
+    return _strip_markup("\n".join(pages))
+
+
+def _read_docx(path):
+    from docx import Document
+    document = Document(str(path))
+    paragraphs = [paragraph.text for paragraph in document.paragraphs if paragraph.text.strip()]
+    for table in document.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                if cell.text.strip():
+                    paragraphs.append(cell.text.strip())
+    return _strip_markup("\n".join(paragraphs))
+
+
+def _read_xlsx(path):
+    from openpyxl import load_workbook
+    workbook = load_workbook(str(path), read_only=True, data_only=True)
+    rows = []
+    for sheet in workbook.worksheets[:3]:
+        rows.append(f"Sheet: {sheet.title}")
+        for index, row in enumerate(sheet.iter_rows(values_only=True)):
+            if index >= 30:
+                break
+            values = [str(cell) for cell in row if cell is not None]
+            if values:
+                rows.append(" | ".join(values))
+    workbook.close()
+    return _strip_markup("\n".join(rows))
+
+
+def _read_pptx(path):
+    from pptx import Presentation
+    presentation = Presentation(str(path))
+    slides = []
+    for index, slide in enumerate(presentation.slides[:15]):
+        texts = []
+        for shape in slide.shapes:
+            if hasattr(shape, "text") and shape.text.strip():
+                texts.append(shape.text)
+        if texts:
+            slides.append(f"Slide {index + 1}: {' '.join(texts)}")
+    return _strip_markup("\n".join(slides))
+
+
 def read_and_speak(command, spoken_name="Orion"):
     """Handle 'read <file>' requests. Returns text for Orion to speak."""
     match = re.search(
@@ -131,8 +206,11 @@ def read_and_speak(command, spoken_name="Orion"):
     if path is None:
         return f"I couldn't find a file called {requested}. Try the full file name."
 
-    content = read_text_file(path)
+    content = read_document(path)
     if content is None:
+        extension = path.suffix.lower()
+        if extension in (".docx", ".xlsx", ".pptx"):
+            return f"I found {path.name}, but the {extension.replace('.', '').upper()} reading library isn't ready."
         return f"I found {path.name} but could not read it as text."
 
     memory.set("last_file", str(path))
@@ -141,6 +219,39 @@ def read_and_speak(command, spoken_name="Orion"):
         return f"I read {path.name}. Here is what it says. {content}"
     return (f"I read {path.name}, which is {len(content):,} characters long. "
             f"Here is the beginning. {content[:MAX_READ_CHARS]}")
+
+
+def summarize_file(command):
+    """Read a file and ask the AI for a short summary of it."""
+    requested = command.replace("summarize", "").replace("summarise", "")
+    requested = requested.replace("the file", "").replace("this file", "").replace("that file", "").strip()
+    path = find_file(requested) if requested else None
+    if path is None:
+        saved = memory.get("last_file", "")
+        if saved and os.path.exists(saved):
+            path = saved
+    if path is None:
+        return "Which file should I summarize? Name the file you read earlier, or say summarize then the file name."
+    content = read_document(path)
+    if not content:
+        return f"I could not read {os.path.basename(path)}."
+    try:
+        from brain import summarize_text
+        summary = summarize_text(content[:4000])
+        return f"Here's a summary of {os.path.basename(path)}: {summary}"
+    except Exception as error:
+        print("SUMMARIZE ERROR:", error)
+        return f"I could not summarize {os.path.basename(path)}."
+
+
+def create_note(title, body):
+    """Save a note as a text file under Documents/OrionNotes."""
+    os.makedirs(NOTES_DIR, exist_ok=True)
+    safe_title = "".join(ch for ch in title if ch.isalnum() or ch in " _-").strip() or "note"
+    filename = os.path.join(NOTES_DIR, f"{safe_title}.txt")
+    with open(filename, "w", encoding="utf-8") as handle:
+        handle.write(str(body) + "\n")
+    return filename
 
 
 def _is_not_a_file_phrase(text):

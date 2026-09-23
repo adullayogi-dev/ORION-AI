@@ -1,7 +1,12 @@
+# ORION AI ASSISTANT
+# Upgrade complete: tool-calling brain, offline STT, live transcript window,
+# system control, reminders, scheduler, tray icon, packaging and autostart.
+
 import asyncio
 import ctypes
 import os
 import re
+import sys
 import time
 from collections import deque
 
@@ -12,9 +17,13 @@ import speech_recognition as sr
 import edge_tts
 
 import memory
-from brain import SPOKEN_NAME, ask_ai, clean_answer, detect_requested_language, start_ollama
-from commands import execute_command
+import packaging
+import stt
+import system_control
+from brain import SPOKEN_NAME, ask_ai_with_tools, clean_answer, detect_requested_language, start_ollama
+from commands import execute_command, set_confirm_callback
 from island import OrionIsland
+from scheduler import Scheduler
 
 # ============================================================
 # ORION CONFIG
@@ -28,8 +37,6 @@ MIN_VOICE_THRESHOLD = 180
 NOISE_MULTIPLIER = 3.0
 PRE_ROLL_SECONDS = 0.35
 
-STT_TIMEOUT = 4
-
 SPEECH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "orion_speech.mp3")
 SPEECH_RATE = "+10%"
 SPEECH_PITCH = "-1Hz"
@@ -40,11 +47,12 @@ WAKE_WORDS = [
 ]
 
 SLEEP_WORDS = ["sleep", "go to sleep", "sleep now", "sleep orion", "goodnight orion"]
+STOP_WORDS = ["stop", "exit", "quit", "bye", "goodbye"]
 
 MAX_SILENT_TURNS = 3
 
-# Kept open for the life of the process so only one Orion can run.
 SINGLE_INSTANCE_MUTEX = None
+ISLAND: OrionIsland | None = None
 
 
 def ensure_single_instance():
@@ -88,6 +96,11 @@ def detect_script_language(text):
     return "en"
 
 
+def set_speech_rate(rate):
+    global SPEECH_RATE
+    SPEECH_RATE = rate
+
+
 async def _generate_speech(text, voice):
     communicate = edge_tts.Communicate(text, voice, rate=SPEECH_RATE, pitch=SPEECH_PITCH)
     await communicate.save(SPEECH_FILE)
@@ -100,8 +113,12 @@ def speak(text):
 
     try:
         print("ORION:", text)
+        packaging.log("ORION: " + text)
     except UnicodeEncodeError:
         pass
+
+    if ISLAND is not None:
+        ISLAND.log("assistant", text)
 
     lang = detect_script_language(text)
     voice = VOICE_MAP.get(lang, VOICE_MAP["en"])
@@ -118,7 +135,7 @@ def speak(text):
 
 
 # ============================================================
-# MICROPHONE
+# MICROPHONE + OFFLINE STT
 # ============================================================
 
 def volume(audio):
@@ -126,7 +143,8 @@ def volume(audio):
     return float(np.sqrt(np.mean(audio * audio)))
 
 
-def listen():
+def record_command():
+    """Record until the user stops talking. Returns AudioData or None."""
     print()
     print("ORION is listening...")
     print("Speak now!")
@@ -187,34 +205,26 @@ def listen():
         return None
 
     recording = np.concatenate(chunks, axis=0)
-    audio_data = sr.AudioData(recording.tobytes(), SAMPLE_RATE, 2)
+    return sr.AudioData(recording.tobytes(), SAMPLE_RATE, 2)
 
-    recognizer = sr.Recognizer()
-    recognizer.operation_timeout = STT_TIMEOUT
 
-    try:
-        try:
-            text = recognizer.recognize_google(audio_data, language="en-IN")
-        except sr.UnknownValueError:
-            text = recognizer.recognize_google(audio_data, language="en-US")
+def listen():
+    """Record and transcribe offline (Whisper), Google as fallback."""
+    audio_data = record_command()
+    if audio_data is None:
+        return None
 
-        text = text.strip()
-        if not text:
-            return None
-
-        print("YOU:", text)
-        return text.lower()
-
-    except sr.UnknownValueError:
+    text, engine = stt.recognize(audio_data, language="en-IN")
+    text = text.strip()
+    if not text:
         print("ORION: I couldn't understand that.")
         return ""
-    except sr.RequestError as error:
-        print("Speech recognition error:", error)
-        return ""
+    print(f"YOU:{engine}", text)
+    return text.lower()
 
 
 # ============================================================
-# WAKE WORD
+# WAKE WORD / QUICK RESPONSES
 # ============================================================
 
 def wait_for_wake_word():
@@ -228,10 +238,6 @@ def wait_for_wake_word():
         if any(wake in heard for wake in WAKE_WORDS):
             return
 
-
-# ============================================================
-# FAST LOCAL RESPONSES
-# ============================================================
 
 def quick_response(command):
     command = command.lower().strip()
@@ -247,7 +253,10 @@ def quick_response(command):
     if "what is your name" in command or "who are you" in command:
         return f"I'm {SPOKEN_NAME}, your personal AI assistant, Boss."
     if "what can you do" in command or "what do you do" in command:
-        return "I can open any app, take photos and screenshots, read files, watch your screen, do maths, search the web, and answer your questions, Boss."
+        return ("I can open any app, take photos and screenshots, watch your screen, "
+                "read and summarize files, set reminders, control volume and brightness, "
+                "check battery and Wi-Fi, translate, tell weather and news, type and click, "
+                "and answer your questions, Boss.")
     if "thank you" in command or "thanks" in command:
         return "You're welcome, Boss."
     if "how are you" in command:
@@ -256,11 +265,8 @@ def quick_response(command):
 
 
 # ============================================================
-# STOP / SLEEP
+# COMMAND HANDLING
 # ============================================================
-
-STOP_WORDS = ["stop", "exit", "quit", "bye", "goodbye"]
-
 
 def is_stop_command(command):
     command = command.strip()
@@ -275,9 +281,15 @@ def is_sleep_command(command):
     return any(word in command for word in SLEEP_WORDS)
 
 
-# ============================================================
-# CONVERSATION MEMORY
-# ============================================================
+def ask_confirmation(prompt):
+    """Confirm destructive actions by voice. Returns True/False."""
+    speak(prompt)
+    reply = listen()
+    if not reply:
+        return False
+    return any(word in reply for word in
+               ("yes", "yeah", "yep", "sure", "do it", "go ahead", "confirm", "okay", "ok "))
+
 
 def remember(history, role, text):
     text = clean_answer(text)
@@ -288,6 +300,7 @@ def remember(history, role, text):
     history.append({"role": role, "content": text})
     while len(history) > 12:
         history.popleft()
+    memory.remember_turn(role, text)
 
 
 # ============================================================
@@ -298,21 +311,28 @@ def run_orion(island):
     history = deque()
 
     while True:
+        island.hide()
+        speak(f"Going to sleep, Boss. Say hello {SPOKEN_NAME} to wake me.")
         wait_for_wake_word()
 
         island.show("ORION AWAKE", "Listening...")
         speak("Yes, Boss?")
-
         silent_turns = 0
 
         while True:
+            control = island.take_control()
+            if control == "sleep":
+                break
+            if control == "stop":
+                island.close()
+                speak("Goodbye. See you later.")
+                return
+
             command = listen()
 
             if command is None:
                 silent_turns += 1
                 if silent_turns >= MAX_SILENT_TURNS:
-                    island.hide()
-                    speak(f"Going back to sleep, Boss. Say hello {SPOKEN_NAME} to wake me.")
                     break
                 continue
 
@@ -329,8 +349,6 @@ def run_orion(island):
                 return
 
             if is_sleep_command(command):
-                island.hide()
-                speak("Okay Boss, going to sleep.")
                 break
 
             quick = quick_response(command)
@@ -346,7 +364,7 @@ def run_orion(island):
                 continue
 
             target_language = detect_requested_language(command)
-            answer = ask_ai(
+            answer = ask_ai_with_tools(
                 command,
                 target_language=target_language,
                 history=list(history),
@@ -356,14 +374,38 @@ def run_orion(island):
             speak(answer)
 
 
+def reminder_fired():
+    """Notification + spoken reminder when a scheduled reminder is due."""
+
+    def fire(text):
+        if ISLAND is not None:
+            ISLAND.show("ORION REMINDER", "Speaking")
+        try:
+            speak(f"Reminder. {text}")
+        except Exception:
+            pass
+        try:
+            import winotify
+            toast = winotify.Notification(app_id="ORION AI", title="Orion Reminder", msg=text)
+            toast.show()
+        except Exception as error:
+            print("TOAST ERROR:", error)
+
+    return fire
+
+
 # ============================================================
 # START
 # ============================================================
 
-if __name__ == "__main__":
+def main():
+    global ISLAND
 
     if not ensure_single_instance():
         raise SystemExit(0)
+
+    packaging.setup_logging()
+    packaging.log("ORION starting.")
 
     pygame.mixer.init()
 
@@ -373,16 +415,41 @@ if __name__ == "__main__":
     print("======================================")
     print()
 
-    island = OrionIsland()
-    island.start()
+    if "--autostart" in sys.argv:
+        system_control.set_autostart(True)
+        print("Autostart enabled.")
+    if "--no-autostart" in sys.argv:
+        system_control.set_autostart(False)
+        print("Autostart disabled.")
+    print("Autostart:", "ON" if packaging.is_autostart_enabled() else "OFF")
+
+    ISLAND = OrionIsland()
+    ISLAND.start()
+
+    scheduler_manager = Scheduler()
+    scheduler_manager.on_fire(reminder_fired())
+    scheduler_manager.start()
+
+    set_confirm_callback(ask_confirmation)
+
+    packaging.tray_icon(on_sleep=lambda: ISLAND.hide() if ISLAND else None,
+                        on_stop=lambda: ISLAND.close() if ISLAND else None)
 
     start_ollama()
 
     speak(f"Hello Boss. I am {SPOKEN_NAME}. Say hello {SPOKEN_NAME} whenever you need me.")
 
     try:
-        run_orion(island)
+        run_orion(ISLAND)
     except KeyboardInterrupt:
         print()
         print("ORION: Shutting down. Goodbye!")
-        island.close()
+    finally:
+        scheduler_manager.stop()
+        if ISLAND is not None:
+            ISLAND.close()
+        packaging.log("ORION stopped.")
+
+
+if __name__ == "__main__":
+    main()
