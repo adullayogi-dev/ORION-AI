@@ -216,7 +216,7 @@ class OrionIsland:
                         50, int(90 + 45 * (math.sin(phase) + 1) / 2), 255,
                     )
                     canvas.itemconfig("orb", outline=glow)
-                animation_id = root.after(45, animate)
+                animation_id = root.after(100, animate)
 
             def process_events() -> None:
                 nonlocal events_id, stopping
@@ -252,7 +252,7 @@ class OrionIsland:
                 events_id = root.after(30, process_events)
 
             events_id = root.after(30, process_events)
-            animation_id = root.after(45, animate)
+            animation_id = root.after(100, animate)
             self._ready.set()
             root.mainloop()
         except Exception:

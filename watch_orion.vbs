@@ -1,20 +1,19 @@
 Option Explicit
 
-' Background supervisor for Orion. Launched at login by HKCU Run.
-' Starts the assistant with no console window and restarts it within a few
-' seconds if it ever exits unexpectedly. A deliberate Sleep/Quit from the
-' tray creates orion.stop, which makes this watcher exit instead.
+' Silent background supervisor for Orion, launched at login by HKCU Run.
+' Polls every few seconds and starts Orion only when it is genuinely absent.
+' Uses Run rather than Exec so the watcher never holds a console handle or
+' terminates a healthy assistant by mistake.
 
-Dim shell, fso, project, pythonExe, command, proc, stopFlag
-
+Dim shell, fso, project, pythonExe, command, stopFlag, logFile
 Set shell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 
 project = fso.GetParentFolderName(WScript.ScriptFullName)
 stopFlag = project & "\orion.stop"
+logFile = project & "\orion_watch.log"
 
-' A fresh login must always start Orion, even if the previous session ended
-' with an explicit Quit. Clear the stale marker once, here at startup.
+' A fresh login always starts Orion, even after a previous explicit Quit.
 If fso.FileExists(stopFlag) Then fso.DeleteFile stopFlag, True
 
 If fso.FileExists(project & "\.venv\Scripts\pythonw.exe") Then
@@ -27,26 +26,46 @@ End If
 
 command = """" & pythonExe & """ """ & project & "\orion.py"""
 
-Do While True
-    If fso.FileExists(stopFlag) Then Exit Do
-
+Function OrionRunning()
+    Dim wmi, procs, proc
+    OrionRunning = False
     On Error Resume Next
-    Set proc = shell.Exec(command)
-    If Err.Number <> 0 Then
-        Err.Clear
-    Else
-        On Error GoTo 0
-        Do While proc.Status = 0
-            If fso.FileExists(stopFlag) Then
-                On Error Resume Next
-                proc.Terminate()
-                On Error GoTo 0
-                Exit Do
-            End If
-            WScript.Sleep 3000
-        Loop
-    End If
+    Set wmi = GetObject("winmgmts:\\.\root\cimv2")
+    Set procs = wmi.ExecQuery("Select CommandLine from Win32_Process Where Name = 'pythonw.exe'")
+    For Each proc In procs
+        If InStr(1, proc.CommandLine, "orion.py", vbTextCompare) > 0 Then
+            OrionRunning = True
+            Exit Function
+        End If
+    Next
     On Error GoTo 0
+End Function
 
-    WScript.Sleep 3000
+Sub WatchLog(message)
+    On Error Resume Next
+    Dim handle
+    Set handle = fso.OpenTextFile(logFile, 8, True)
+    handle.WriteLine Now & " " & message
+    handle.Close
+    On Error GoTo 0
+End Sub
+
+WatchLog "watchdog started"
+
+Do While True
+    If fso.FileExists(stopFlag) Then
+        WatchLog "explicit stop requested"
+        Exit Do
+    End If
+
+    If Not OrionRunning() Then
+        WatchLog "starting Orion"
+        shell.Run command, 0, False
+        ' Give the process time to appear before checking again.
+        WScript.Sleep 12000
+    Else
+        WScript.Sleep 4000
+    End If
 Loop
+
+WatchLog "watchdog stopped"

@@ -51,6 +51,8 @@ SLEEP_WORDS = ["sleep", "go to sleep", "sleep now", "sleep orion", "goodnight or
 STOP_WORDS = ["stop", "exit", "quit", "bye", "goodbye"]
 
 MAX_SILENT_TURNS = 3
+LAST_AUDIO_ERROR_LOG = 0.0
+OLLAMA_READY = False
 
 SINGLE_INSTANCE_MUTEX = None
 ISLAND: OrionIsland | None = None
@@ -148,6 +150,17 @@ def speak(text):
 # MICROPHONE + OFFLINE STT
 # ============================================================
 
+def safe_print(*parts):
+    """Print without dying on non-ASCII text in pythonw's cp1252 stream."""
+    try:
+        print(*parts)
+    except (UnicodeEncodeError, ValueError):
+        try:
+            print(" ".join(str(p).encode("ascii", "replace").decode() for p in parts))
+        except Exception:
+            pass
+
+
 def volume(audio):
     audio = audio.astype(np.float32)
     return float(np.sqrt(np.mean(audio * audio)))
@@ -223,6 +236,7 @@ def listen():
 
     Never let a microphone/driver hiccup kill the background assistant.
     """
+    global LAST_AUDIO_ERROR_LOG
     try:
         audio_data = record_command()
         if audio_data is None:
@@ -233,13 +247,17 @@ def listen():
         if not text:
             print("ORION: I couldn't understand that.")
             return ""
-        print(f"YOU:{engine}", text)
+        safe_print(f"YOU:{engine}", text)
         return text.lower()
     except Exception as error:
         detail = f"LISTEN ERROR: {type(error).__name__}: {error}"
-        print(detail)
-        packaging.log(detail)
-        time.sleep(1.0)
+        safe_print(detail)
+        # Log audio-device hiccups sparingly; they can repeat every second.
+        now = time.time()
+        if now - LAST_AUDIO_ERROR_LOG >= 60:
+            packaging.log(detail)
+            LAST_AUDIO_ERROR_LOG = now
+        time.sleep(1.5)
         return None
 
 
@@ -335,12 +353,13 @@ def remember(history, role, text):
 # ============================================================
 
 def run_orion(island):
+    global OLLAMA_READY
     history = deque()
 
     while True:
         island.hide()
+        # Silent by design: sleeping is logged, never spoken.
         packaging.log(f"STATE: sleeping (pid {os.getpid()})")
-        speak(f"Going to sleep, Boss. Say hello {SPOKEN_NAME} to wake me.")
         wait_for_wake_word(island)
         packaging.log("STATE: wake word detected")
 
@@ -400,6 +419,11 @@ def run_orion(island):
                     continue
 
                 target_language = detect_requested_language(command)
+                if not OLLAMA_READY:
+                    # Start the local model only when an AI answer is actually
+                    # needed - keeps startup fast and memory low.
+                    start_ollama(silent=True)
+                    OLLAMA_READY = True
                 answer = ask_ai_with_tools(
                     command,
                     target_language=target_language,
@@ -478,9 +502,9 @@ def main():
     packaging.tray_icon(on_sleep=lambda: ISLAND.request_sleep() if ISLAND else None,
                         on_stop=lambda: ISLAND.request_stop() if ISLAND else None)
 
-    start_ollama()
-
-    speak(f"Hello Boss. I am {SPOKEN_NAME}. Say hello {SPOKEN_NAME} whenever you need me.")
+    # No spoken greeting and no Ollama launch here: login must be silent and
+    # fast. The model starts on the first real question instead.
+    packaging.log(f"READY: say hello {SPOKEN_NAME}")
 
     try:
         run_orion(ISLAND)

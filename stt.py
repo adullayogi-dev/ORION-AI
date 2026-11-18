@@ -7,7 +7,10 @@ import threading
 
 import numpy as np
 
-WHISPER_MODEL = os.environ.get("ORION_WHISPER_MODEL", "small")
+# tiny.en is ~75 MB (vs ~460 MB for small), loads in ~2 s, and is accurate
+# enough for wake words and short commands. Set ORION_WHISPER_MODEL=small
+# if you prefer maximum accuracy on a powerful machine.
+WHISPER_MODEL = os.environ.get("ORION_WHISPER_MODEL", "tiny.en")
 
 _model = None
 _model_lock = threading.Lock()
@@ -58,7 +61,10 @@ def transcribe(audio_int16, sample_rate=16000):
 
     try:
         model = _load_model()
-        segments, _info = model.transcribe(audio, beam_size=5)
+        # beam_size=1 keeps wake-word/command latency low.
+        segments, _info = model.transcribe(
+            audio, beam_size=1, condition_on_previous_text=False
+        )
         text = " ".join(segment.text.strip() for segment in segments).strip()
         return text
     except Exception as error:
