@@ -59,6 +59,14 @@ class OrionIsland:
         except queue.Empty:
             return None
 
+    def request_sleep(self) -> None:
+        """Ask the assistant loop to go to sleep (used by the tray icon)."""
+        self._control_events.put("sleep")
+
+    def request_stop(self) -> None:
+        """Ask the assistant loop to quit (used by the tray icon)."""
+        self._control_events.put("stop")
+
     # ---------------- tkinter runner ----------------
 
     def _run(self) -> None:

@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import time
+import traceback
 from collections import deque
 
 import numpy as np
@@ -214,18 +215,28 @@ def record_command():
 
 
 def listen():
-    """Record and transcribe offline (Whisper), Google as fallback."""
-    audio_data = record_command()
-    if audio_data is None:
-        return None
+    """Record and transcribe offline (Whisper), Google as fallback.
 
-    text, engine = stt.recognize(audio_data, language="en-IN")
-    text = text.strip()
-    if not text:
-        print("ORION: I couldn't understand that.")
-        return ""
-    print(f"YOU:{engine}", text)
-    return text.lower()
+    Never let a microphone/driver hiccup kill the background assistant.
+    """
+    try:
+        audio_data = record_command()
+        if audio_data is None:
+            return None
+
+        text, engine = stt.recognize(audio_data, language="en-IN")
+        text = text.strip()
+        if not text:
+            print("ORION: I couldn't understand that.")
+            return ""
+        print(f"YOU:{engine}", text)
+        return text.lower()
+    except Exception as error:
+        detail = f"LISTEN ERROR: {type(error).__name__}: {error}"
+        print(detail)
+        packaging.log(detail)
+        time.sleep(1.0)
+        return None
 
 
 # ============================================================
@@ -437,8 +448,8 @@ def main():
 
     set_confirm_callback(ask_confirmation)
 
-    packaging.tray_icon(on_sleep=lambda: ISLAND.hide() if ISLAND else None,
-                        on_stop=lambda: ISLAND.close() if ISLAND else None)
+    packaging.tray_icon(on_sleep=lambda: ISLAND.request_sleep() if ISLAND else None,
+                        on_stop=lambda: ISLAND.request_stop() if ISLAND else None)
 
     start_ollama()
 
@@ -449,6 +460,10 @@ def main():
     except KeyboardInterrupt:
         print()
         print("ORION: Shutting down. Goodbye!")
+    except Exception:
+        detail = "FATAL ERROR:\n" + traceback.format_exc()
+        print(detail)
+        packaging.log(detail)
     finally:
         scheduler_manager.stop()
         if ISLAND is not None:
@@ -457,4 +472,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        detail = "STARTUP FATAL ERROR:\n" + traceback.format_exc()
+        print(detail)
+        try:
+            with open(packaging.LOG_FILE, "a", encoding="utf-8") as handle:
+                handle.write(detail + "\n")
+        except Exception:
+            pass

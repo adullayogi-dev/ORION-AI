@@ -72,8 +72,7 @@ def tray_icon(on_sleep, on_stop):
     menu = None
     try:
         menu = pystray.Menu(
-            pystray.MenuItem("Wake Orion", lambda icon, item: on_sleep(), default=True),
-            pystray.MenuItem("Sleep", on_sleep),
+            pystray.MenuItem("Sleep", on_sleep, default=True),
             pystray.MenuItem("Quit", on_stop),
         )
         icon = pystray.Icon("ORION", build_image(), "ORION AI", menu)

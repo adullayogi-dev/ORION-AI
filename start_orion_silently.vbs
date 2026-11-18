@@ -2,13 +2,13 @@ Option Explicit
 
 ' Starts Orion without a terminal window. The one-instance lock in orion.py
 ' prevents a duplicate if the assistant is already running.
-' Resolves the virtual environment automatically: newer installs use "venv",
-' older ones used ".venv".
+' The project folder is derived from this script's own location, so moving the
+' project (or OneDrive changing the Desktop path) cannot break silent start.
 Dim shell, fso, project, pythonExe, command
 Set shell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 
-project = "C:\Users\adull\OneDrive\Desktop\ORION-AI"
+project = fso.GetParentFolderName(WScript.ScriptFullName)
 
 If fso.FileExists(project & "\.venv\Scripts\pythonw.exe") Then
     pythonExe = project & "\.venv\Scripts\pythonw.exe"
