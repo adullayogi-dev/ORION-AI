@@ -57,14 +57,19 @@ ISLAND: OrionIsland | None = None
 
 def ensure_single_instance():
     global SINGLE_INSTANCE_MUTEX
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    SINGLE_INSTANCE_MUTEX = kernel32.CreateMutexW(None, False, "Local\\ORION_AI_VOICE_ASSISTANT")
+    kernel32 = ctypes.windll.kernel32
+    # Clear any stale error first, then read GetLastError immediately after
+    # CreateMutexW. ERROR_ALREADY_EXISTS (183) means another Orion owns it.
+    kernel32.SetLastError(0)
+    SINGLE_INSTANCE_MUTEX = kernel32.CreateMutexW(
+        None, False, "Local\\ORION_AI_VOICE_ASSISTANT"
+    )
 
     if not SINGLE_INSTANCE_MUTEX:
         print("ORION: Could not create the single-instance lock.")
         return False
 
-    if ctypes.get_last_error() == 183:
+    if kernel32.GetLastError() == 183:
         print("Orion is already running. Close the existing assistant before starting another one.")
         return False
 
