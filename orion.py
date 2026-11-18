@@ -4,6 +4,7 @@
 
 import asyncio
 import ctypes
+import difflib
 import os
 import re
 import sys
@@ -43,9 +44,11 @@ CALIBRATION_SECONDS = 0.8
 SPEECH_REQUIRED_BLOCKS = 3               # ~300 ms of real speech before recording
 MIN_UTTERANCE_SECONDS = 0.45             # discard short noise bursts
 NOISE_ADAPT_RATE = 0.03
-# Wake mode is deliberately stricter: TV/radio speech must not wake Orion.
-WAKE_NOISE_MULTIPLIER = 4.0
-WAKE_MIN_THRESHOLD = 500
+# Wake mode uses a bounded threshold: loud rooms must not make Orion deaf.
+# Background chatter is rejected by wake_match(), not by an unreachable gate.
+WAKE_NOISE_MULTIPLIER = 2.0
+WAKE_MIN_THRESHOLD = 300
+WAKE_MAX_THRESHOLD = 2000
 WAKE_MAX_SECONDS = 3.0
 MIC_BLOCKED_UNTIL = 0.0                  # prevents hearing Orion's own answers
 
@@ -61,15 +64,37 @@ WAKE_WORDS = [
 ]
 
 
-GREETING_WORDS = {"hello", "hey", "hi", "okay", "ok", "yo", "good"}
-NAME_WORDS = {"orion", "orian", "ryan", "arion", "oreon", "orryan", "ohrion", "orien"}
+GREETING_WORDS = {"hello", "hey", "hi", "okay", "ok", "yo", "good", "greetings"}
+NAME_WORDS = {
+    "orion", "orian", "ryan", "arion", "oreon", "orryan", "ohrion", "orien",
+    "orie", "oree", "oryan", "rion", "oriano", "ohryan", "orionn", "oreo",
+    "ohreeyon", "ohreeon", "ohreeyawn",
+}
+
+
+def _name_score(token):
+    """How strongly a token resembles 'Orion' (0..1)."""
+    if len(token) < 3:
+        return 0.0
+    if token in NAME_WORDS:
+        return 1.0
+    return max(
+        (
+            difflib.SequenceMatcher(None, token, name).ratio()
+            for name in NAME_WORDS
+            if len(name) >= 4
+        ),
+        default=0.0,
+    )
 
 
 def wake_match(text):
     """Return (is_wake, remaining_command) for a spoken wake phrase.
 
-    Tolerates punctuation, missing spaces and common Whisper mishearings
-    ("Hello, Ryan open Chrome", "helloryan open chrome", "hey orien ...").
+    Tolerates punctuation, missing spaces and the misspellings Whisper makes
+    ("Hello, Orie.", "helloryan open chrome", "oh ree yon ..."). A greeting
+    must be near the name so ordinary speech like "hello everyone" or
+    "thank you" is ignored.
     """
     normalized = re.sub(r"[^a-z0-9 ]+", " ", text.lower())
     normalized = re.sub(r"\s+", " ", normalized).strip()
@@ -80,15 +105,24 @@ def wake_match(text):
         if match:
             return True, normalized[match.end():].strip()
 
-    # Fuzzy fallback: a name-like word with a greeting just before it, or the
-    # name on its own. This catches spellings Whisper invents.
     tokens = re.findall(r"[a-z]+", normalized)
+
+    # A single name-like word ("Orion", "Orie") counts as a wake.
     for index, token in enumerate(tokens):
-        if token not in NAME_WORDS:
+        if _name_score(token) < 0.75:
             continue
         previous = tokens[max(0, index - 2):index]
         if any(word in GREETING_WORDS for word in previous) or len(tokens) == 1:
             return True, " ".join(tokens[index + 1:])
+
+    # Split-name case: "oh ree yon" / "oh ryan" -> join adjacent short tokens.
+    for index in range(len(tokens) - 2):
+        joined = tokens[index] + tokens[index + 1] + tokens[index + 2]
+        if _name_score(joined) < 0.78:
+            continue
+        previous = tokens[max(0, index - 2):index]
+        if any(word in GREETING_WORDS for word in previous) or index == 0:
+            return True, " ".join(tokens[index + 3:])
     return False, ""
 
 SLEEP_WORDS = ["sleep", "go to sleep", "sleep now", "sleep orion", "goodnight orion"]
@@ -245,6 +279,14 @@ def looks_like_speech(features, threshold):
     return flatness < 0.42 or low_ratio > 0.62
 
 
+def effective_threshold(min_threshold, multiplier, noise_rms, strict):
+    """Noise-adaptive threshold, with a ceiling so loud rooms can't deafen us."""
+    value = max(min_threshold, noise_rms * multiplier)
+    if strict:
+        value = min(WAKE_MAX_THRESHOLD, value)
+    return value
+
+
 def record_command(strict=False):
     """Record a real utterance, ignoring steady background noise.
 
@@ -293,7 +335,7 @@ def record_command(strict=False):
             noise_rms = float(np.percentile([f[0] for f in calibration], 75))
         else:
             noise_rms = float(MIN_VOICE_THRESHOLD)
-        threshold = max(min_threshold, noise_rms * multiplier)
+        threshold = effective_threshold(min_threshold, multiplier, noise_rms, strict)
         print(f"Microphone ready (threshold: {threshold:.0f})")
 
         while True:
@@ -317,7 +359,7 @@ def record_command(strict=False):
                 else:
                     voice_blocks = 0
                     noise_rms += (features[0] - noise_rms) * NOISE_ADAPT_RATE
-                    threshold = max(min_threshold, noise_rms * multiplier)
+                    threshold = effective_threshold(min_threshold, multiplier, noise_rms, strict)
             else:
                 chunks.append(audio)
                 if speech:
@@ -396,6 +438,8 @@ def wait_for_wake_word(island=None):
             continue
         is_wake, remainder = wake_match(heard)
         if is_wake:
+            print(">>> WAKE WORD DETECTED <<<")
+            packaging.log(f"WAKE WORD DETECTED: {heard}")
             # "hello Orion, open Chrome" -> also execute "open Chrome".
             return remainder
 
