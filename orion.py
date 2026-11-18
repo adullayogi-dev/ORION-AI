@@ -34,9 +34,16 @@ SAMPLE_RATE = 16000
 SILENCE_SECONDS = 0.55
 MAX_LISTEN_SECONDS = 10
 
-MIN_VOICE_THRESHOLD = 180
-NOISE_MULTIPLIER = 3.0
+MIN_VOICE_THRESHOLD = 160
+NOISE_MULTIPLIER = 2.4
 PRE_ROLL_SECONDS = 0.35
+
+BLOCK_SAMPLES = 1600                     # 100 ms at 16 kHz
+CALIBRATION_SECONDS = 0.8
+SPEECH_REQUIRED_BLOCKS = 3               # ~300 ms of real speech before recording
+MIN_UTTERANCE_SECONDS = 0.45             # discard short noise bursts
+NOISE_ADAPT_RATE = 0.03
+MIC_BLOCKED_UNTIL = 0.0                  # prevents hearing Orion's own answers
 
 SPEECH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "orion_speech.mp3")
 SPEECH_RATE = "+10%"
@@ -44,8 +51,26 @@ SPEECH_PITCH = "-1Hz"
 
 WAKE_WORDS = [
     "hey orion", "hi orion", "hello orion", "okay orion", "ok orion",
-    "hey orian", "hi orian", "hello orian",
+    "hey orian", "hi orian", "hello orian", "okay orian", "ok orian",
+    "hey ryan", "hi ryan", "hello ryan", "okay ryan", "ok ryan",
+    "hey arion", "hi arion", "hello arion",
 ]
+
+
+def wake_match(text):
+    """Return (is_wake, remaining_command) for a spoken wake phrase.
+
+    Tolerates punctuation and missing spaces, e.g. "Hello, Ryan open Chrome"
+    or "helloryan open chrome".
+    """
+    normalized = re.sub(r"[^a-z0-9 ]+", " ", text.lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    for phrase in WAKE_WORDS:
+        pattern = r"\b" + r"\s*".join(re.escape(word) for word in phrase.split()) + r"\b"
+        match = re.search(pattern, normalized)
+        if match:
+            return True, normalized[match.end():].strip()
+    return False, ""
 
 SLEEP_WORDS = ["sleep", "go to sleep", "sleep now", "sleep orion", "goodnight orion"]
 STOP_WORDS = ["stop", "exit", "quit", "bye", "goodbye"]
@@ -120,6 +145,7 @@ async def _generate_speech(text, voice):
 
 
 def speak(text):
+    global MIC_BLOCKED_UNTIL
     text = clean_answer(text)
     if not text:
         return
@@ -143,6 +169,8 @@ def speak(text):
         while pygame.mixer.music.get_busy():
             time.sleep(0.1)
         pygame.mixer.music.unload()
+        # Ignore the tail of our own voice echo before listening again.
+        MIC_BLOCKED_UNTIL = time.time() + 0.5
     except Exception as error:
         print("Voice error:", error)
 
@@ -167,56 +195,112 @@ def volume(audio):
     return float(np.sqrt(np.mean(audio * audio)))
 
 
+def speech_features(audio):
+    """Return (rms, spectral_flatness, low_frequency_ratio) for one block.
+
+    Speech is tonal and low-frequency. Fans, hiss and keyboard noise are
+    broadband/flat. This lets us reject background noise that is louder than
+    the simple RMS threshold would allow.
+    """
+    # sounddevice returns (block, channels); flatten to a 1-D mono array.
+    signal = np.asarray(audio, dtype=np.float32).reshape(-1) / 32768.0
+    rms = float(np.sqrt(np.mean(signal * signal))) * 32768.0
+
+    spectrum = np.abs(np.fft.rfft(signal * np.hanning(len(signal)))) + 1e-8
+    spectrum[0] = 0.0
+    frequencies = np.fft.rfftfreq(len(signal), 1.0 / SAMPLE_RATE)
+    low_ratio = float(spectrum[frequencies < 1200].sum() / (spectrum.sum() + 1e-8))
+
+    usable = spectrum[spectrum > 1e-6]
+    flatness = (
+        float(np.exp(np.mean(np.log(usable))) / (np.mean(usable) + 1e-8))
+        if usable.size else 1.0
+    )
+    return rms, flatness, low_ratio
+
+
+def looks_like_speech(features, threshold):
+    rms, flatness, low_ratio = features
+    if rms < threshold:
+        return False
+    return flatness < 0.42 or low_ratio > 0.62
+
+
 def record_command():
-    """Record until the user stops talking. Returns AudioData or None."""
+    """Record a real utterance, ignoring steady background noise.
+
+    Returns AudioData, or None if no convincing speech was heard.
+    """
+    global MIC_BLOCKED_UNTIL
+
+    # Never listen to Orion's own answer playing through the speakers.
+    remaining = MIC_BLOCKED_UNTIL - time.time()
+    if remaining > 0:
+        time.sleep(min(remaining, 1.0))
+
     print()
     print("ORION is listening...")
     print("Speak now!")
 
     chunks = []
-    pre_roll = deque(maxlen=max(1, int(PRE_ROLL_SECONDS * SAMPLE_RATE / 1600)))
+    pre_roll = deque(maxlen=max(1, int(PRE_ROLL_SECONDS * SAMPLE_RATE / BLOCK_SAMPLES)))
     started = False
-    silence_start = None
+    voice_blocks = 0
+    silent_blocks = 0
     beginning = time.time()
 
     with sd.InputStream(
         samplerate=SAMPLE_RATE,
         channels=1,
         dtype="int16",
-        blocksize=1600,
+        blocksize=BLOCK_SAMPLES,
     ) as stream:
+        # Calibrate the current room noise. 75th percentile avoids a single
+        # cough making the threshold too low for everything afterwards.
+        calibration = []
+        blocks = max(3, int(CALIBRATION_SECONDS * SAMPLE_RATE / BLOCK_SAMPLES))
+        for _ in range(blocks):
+            audio, overflow = stream.read(BLOCK_SAMPLES)
+            if not overflow:
+                calibration.append(speech_features(audio.copy()))
 
-        calibration_levels = []
-        calibration_end = time.time() + 0.3
-        while time.time() < calibration_end:
-            audio, overflow = stream.read(1600)
-            calibration_levels.append(volume(audio.copy()))
-
-        noise_floor = float(np.median(calibration_levels)) if calibration_levels else 0.0
-        voice_threshold = max(MIN_VOICE_THRESHOLD, noise_floor * NOISE_MULTIPLIER)
-        print(f"Microphone ready (threshold: {voice_threshold:.0f})")
+        if calibration:
+            noise_rms = float(np.percentile([f[0] for f in calibration], 75))
+        else:
+            noise_rms = float(MIN_VOICE_THRESHOLD)
+        threshold = max(MIN_VOICE_THRESHOLD, noise_rms * NOISE_MULTIPLIER)
+        print(f"Microphone ready (threshold: {threshold:.0f})")
 
         while True:
-            audio, overflow = stream.read(1600)
-            audio = audio.copy()
-            level = volume(audio)
+            audio, overflow = stream.read(BLOCK_SAMPLES)
+            if overflow:
+                continue
+            audio = audio.copy().reshape(-1)
+            features = speech_features(audio)
+            speech = looks_like_speech(features, threshold)
 
             if not started:
                 pre_roll.append(audio)
-
-            if level > voice_threshold:
-                if not started:
-                    started = True
-                    print("Voice detected")
-                    chunks.extend(pre_roll)
-                silence_start = None
+                if speech:
+                    voice_blocks += 1
+                    if voice_blocks >= SPEECH_REQUIRED_BLOCKS:
+                        started = True
+                        chunks.extend(pre_roll)
+                        chunks.append(audio)
+                        silent_blocks = 0
+                        print("Voice detected")
+                else:
+                    voice_blocks = 0
+                    noise_rms += (features[0] - noise_rms) * NOISE_ADAPT_RATE
+                    threshold = max(MIN_VOICE_THRESHOLD, noise_rms * NOISE_MULTIPLIER)
+            else:
                 chunks.append(audio)
-            elif started:
-                chunks.append(audio)
-                if silence_start is None:
-                    silence_start = time.time()
-                if time.time() - silence_start >= SILENCE_SECONDS:
-                    break
+                if speech:
+                    silent_blocks = 0
+                else:
+                    silent_blocks += 1
+                    if silent_blocks * BLOCK_SAMPLES / SAMPLE_RATE >= SILENCE_SECONDS:
+                        break
 
             if time.time() - beginning >= MAX_LISTEN_SECONDS:
                 break
@@ -225,7 +309,10 @@ def record_command():
     print("Processing your voice...")
 
     if not started:
-        print("ORION: I didn't hear anything.")
+        return None
+
+    duration = len(chunks) * BLOCK_SAMPLES / SAMPLE_RATE
+    if duration < MIN_UTTERANCE_SECONDS:
         return None
 
     recording = np.concatenate(chunks, axis=0)
@@ -281,8 +368,10 @@ def wait_for_wake_word(island=None):
         heard = listen()
         if not heard:
             continue
-        if any(wake in heard for wake in WAKE_WORDS):
-            return
+        is_wake, remainder = wake_match(heard)
+        if is_wake:
+            # "hello Orion, open Chrome" -> also execute "open Chrome".
+            return remainder
 
 
 def quick_response(command):
@@ -365,13 +454,15 @@ def run_orion(island):
             island.show("ORION SLEEPING", "Say hello Orion")
         # Silent by design: sleeping is logged, never spoken.
         packaging.log(f"STATE: sleeping (pid {os.getpid()})")
-        wait_for_wake_word(island)
+        spoken_with_wake = wait_for_wake_word(island)
         packaging.log("STATE: wake word detected")
 
         island.show("ORION AWAKE", "Listening...")
         packaging.log("STATE: awake")
         speak("Yes, Boss?")
         silent_turns = 0
+        # Support "hello Orion, open Chrome" as one utterance.
+        pending_command = spoken_with_wake.strip()
 
         while True:
             control = island.take_control()
@@ -384,7 +475,8 @@ def run_orion(island):
                 speak("Goodbye. See you later.")
                 return
 
-            command = listen()
+            command = pending_command if pending_command else listen()
+            pending_command = ""
 
             if command is None:
                 silent_turns += 1
