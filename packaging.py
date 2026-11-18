@@ -7,6 +7,7 @@ import threading
 import system_control
 
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "orion.log")
+STOP_FLAG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "orion.stop")
 
 _configured = False
 
@@ -36,6 +37,27 @@ def log(message):
 
 def is_autostart_enabled():
     return system_control.get_autostart()
+
+
+def mark_explicit_stop():
+    """Tell the background watchdog that this shutdown was intentional."""
+    try:
+        with open(STOP_FLAG, "w", encoding="utf-8") as handle:
+            handle.write("stop")
+    except Exception:
+        pass
+
+
+def clear_explicit_stop():
+    try:
+        if os.path.exists(STOP_FLAG):
+            os.remove(STOP_FLAG)
+    except Exception:
+        pass
+
+
+def was_explicit_stop():
+    return os.path.exists(STOP_FLAG)
 
 
 class TrayRuntimeError(RuntimeError):
@@ -69,11 +91,24 @@ def tray_icon(on_sleep, on_stop):
         draw.arc((24, 34, 40, 50), start=200, extent=140, fill="#f7a7ff", width=4)
         return image
 
+    # pystray calls actions with (icon, item); wrap the zero-arg callbacks.
+    def sleep_action(icon=None, item=None):
+        try:
+            on_sleep()
+        except Exception as error:
+            print("TRAY SLEEP ERROR:", error)
+
+    def stop_action(icon=None, item=None):
+        try:
+            on_stop()
+        except Exception as error:
+            print("TRAY STOP ERROR:", error)
+
     menu = None
     try:
         menu = pystray.Menu(
-            pystray.MenuItem("Sleep", on_sleep, default=True),
-            pystray.MenuItem("Quit", on_stop),
+            pystray.MenuItem("Sleep", sleep_action, default=True),
+            pystray.MenuItem("Quit", stop_action),
         )
         icon = pystray.Icon("ORION", build_image(), "ORION AI", menu)
         thread = threading.Thread(target=icon.run, name="orion-tray", daemon=True)

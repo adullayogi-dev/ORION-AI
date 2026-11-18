@@ -324,7 +324,7 @@ def window_action(action, app_name):
 
 def set_autostart(enabled):
     name = "ORION"
-    exe = os.path.join(os.path.dirname(os.path.abspath(__file__)), "start_orion_silently.vbs")
+    exe = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watch_orion.vbs")
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
                             r"Software\Microsoft\Windows\CurrentVersion\Run",

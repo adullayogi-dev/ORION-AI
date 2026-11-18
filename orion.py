@@ -56,6 +56,10 @@ SINGLE_INSTANCE_MUTEX = None
 ISLAND: OrionIsland | None = None
 
 
+class StopRequested(Exception):
+    """Raised when the user asks Orion to quit (tray / orb / voice)."""
+
+
 def ensure_single_instance():
     global SINGLE_INSTANCE_MUTEX
     kernel32 = ctypes.windll.kernel32
@@ -243,11 +247,18 @@ def listen():
 # WAKE WORD / QUICK RESPONSES
 # ============================================================
 
-def wait_for_wake_word():
+def wait_for_wake_word(island=None):
     print()
     print("Waiting for wake word ('Hey Orion')...")
 
     while True:
+        # Tray/Quit must work even while Orion is sleeping.
+        if island is not None:
+            control = island.take_control()
+            if control == "stop":
+                raise StopRequested()
+            # "sleep" is a no-op here - we are already asleep.
+
         heard = listen()
         if not heard:
             continue
@@ -328,15 +339,20 @@ def run_orion(island):
 
     while True:
         island.hide()
+        packaging.log(f"STATE: sleeping (pid {os.getpid()})")
         speak(f"Going to sleep, Boss. Say hello {SPOKEN_NAME} to wake me.")
-        wait_for_wake_word()
+        wait_for_wake_word(island)
+        packaging.log("STATE: wake word detected")
 
         island.show("ORION AWAKE", "Listening...")
+        packaging.log("STATE: awake")
         speak("Yes, Boss?")
         silent_turns = 0
 
         while True:
             control = island.take_control()
+            if control:
+                packaging.log(f"CONTROL: {control}")
             if control == "sleep":
                 break
             if control == "stop":
@@ -349,6 +365,7 @@ def run_orion(island):
             if command is None:
                 silent_turns += 1
                 if silent_turns >= MAX_SILENT_TURNS:
+                    packaging.log("STATE: auto-sleep (no audio)")
                     break
                 continue
 
@@ -360,34 +377,42 @@ def run_orion(island):
             remember(history, "user", command)
 
             if is_stop_command(command):
+                packaging.log("STATE: voice stop")
                 island.close()
                 speak("Goodbye. See you later.")
                 return
 
             if is_sleep_command(command):
+                packaging.log("STATE: voice sleep")
                 break
 
-            quick = quick_response(command)
-            if quick:
-                remember(history, "assistant", quick)
-                speak(quick)
-                continue
+            try:
+                quick = quick_response(command)
+                if quick:
+                    remember(history, "assistant", quick)
+                    speak(quick)
+                    continue
 
-            result = execute_command(command)
-            if result:
-                remember(history, "assistant", result)
-                speak(result)
-                continue
+                result = execute_command(command)
+                if result:
+                    remember(history, "assistant", result)
+                    speak(result)
+                    continue
 
-            target_language = detect_requested_language(command)
-            answer = ask_ai_with_tools(
-                command,
-                target_language=target_language,
-                history=list(history),
-                user_name=memory.get_user_name(),
-            )
-            remember(history, "assistant", answer)
-            speak(answer)
+                target_language = detect_requested_language(command)
+                answer = ask_ai_with_tools(
+                    command,
+                    target_language=target_language,
+                    history=list(history),
+                    user_name=memory.get_user_name(),
+                )
+                remember(history, "assistant", answer)
+                speak(answer)
+            except Exception as error:
+                detail = f"COMMAND ERROR: {type(error).__name__}: {error}"
+                print(detail)
+                packaging.log(detail)
+                speak("Sorry Boss, something went wrong. Please try again.")
 
 
 def reminder_fired():
@@ -421,6 +446,8 @@ def main():
         raise SystemExit(0)
 
     packaging.setup_logging()
+    packaging.clear_explicit_stop()
+    packaging.log(f"LAUNCH: pid={os.getpid()} exe={sys.executable} args={sys.argv[1:]}")
     packaging.log("ORION starting.")
 
     pygame.mixer.init()
@@ -460,13 +487,19 @@ def main():
     except KeyboardInterrupt:
         print()
         print("ORION: Shutting down. Goodbye!")
+    except StopRequested:
+        packaging.log("STATE: stop requested")
     except Exception:
         detail = "FATAL ERROR:\n" + traceback.format_exc()
         print(detail)
         packaging.log(detail)
     finally:
+        packaging.log("STATE: shutting down")
         scheduler_manager.stop()
         if ISLAND is not None:
+            if ISLAND.explicit_stop:
+                packaging.mark_explicit_stop()
+            # Waits until the Tk thread has destroyed its own root.
             ISLAND.close()
         packaging.log("ORION stopped.")
 
