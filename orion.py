@@ -43,6 +43,10 @@ CALIBRATION_SECONDS = 0.8
 SPEECH_REQUIRED_BLOCKS = 3               # ~300 ms of real speech before recording
 MIN_UTTERANCE_SECONDS = 0.45             # discard short noise bursts
 NOISE_ADAPT_RATE = 0.03
+# Wake mode is deliberately stricter: TV/radio speech must not wake Orion.
+WAKE_NOISE_MULTIPLIER = 4.0
+WAKE_MIN_THRESHOLD = 500
+WAKE_MAX_SECONDS = 3.0
 MIC_BLOCKED_UNTIL = 0.0                  # prevents hearing Orion's own answers
 
 SPEECH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "orion_speech.mp3")
@@ -57,19 +61,34 @@ WAKE_WORDS = [
 ]
 
 
+GREETING_WORDS = {"hello", "hey", "hi", "okay", "ok", "yo", "good"}
+NAME_WORDS = {"orion", "orian", "ryan", "arion", "oreon", "orryan", "ohrion", "orien"}
+
+
 def wake_match(text):
     """Return (is_wake, remaining_command) for a spoken wake phrase.
 
-    Tolerates punctuation and missing spaces, e.g. "Hello, Ryan open Chrome"
-    or "helloryan open chrome".
+    Tolerates punctuation, missing spaces and common Whisper mishearings
+    ("Hello, Ryan open Chrome", "helloryan open chrome", "hey orien ...").
     """
     normalized = re.sub(r"[^a-z0-9 ]+", " ", text.lower())
     normalized = re.sub(r"\s+", " ", normalized).strip()
+
     for phrase in WAKE_WORDS:
         pattern = r"\b" + r"\s*".join(re.escape(word) for word in phrase.split()) + r"\b"
         match = re.search(pattern, normalized)
         if match:
             return True, normalized[match.end():].strip()
+
+    # Fuzzy fallback: a name-like word with a greeting just before it, or the
+    # name on its own. This catches spellings Whisper invents.
+    tokens = re.findall(r"[a-z]+", normalized)
+    for index, token in enumerate(tokens):
+        if token not in NAME_WORDS:
+            continue
+        previous = tokens[max(0, index - 2):index]
+        if any(word in GREETING_WORDS for word in previous) or len(tokens) == 1:
+            return True, " ".join(tokens[index + 1:])
     return False, ""
 
 SLEEP_WORDS = ["sleep", "go to sleep", "sleep now", "sleep orion", "goodnight orion"]
@@ -226,12 +245,18 @@ def looks_like_speech(features, threshold):
     return flatness < 0.42 or low_ratio > 0.62
 
 
-def record_command():
+def record_command(strict=False):
     """Record a real utterance, ignoring steady background noise.
 
+    strict=True is used for wake-word detection: a louder threshold and a
+    short window keep TV/radio chatter in the room from waking Orion.
     Returns AudioData, or None if no convincing speech was heard.
     """
     global MIC_BLOCKED_UNTIL
+
+    min_threshold = WAKE_MIN_THRESHOLD if strict else MIN_VOICE_THRESHOLD
+    multiplier = WAKE_NOISE_MULTIPLIER if strict else NOISE_MULTIPLIER
+    max_seconds = WAKE_MAX_SECONDS if strict else MAX_LISTEN_SECONDS
 
     # Never listen to Orion's own answer playing through the speakers.
     remaining = MIC_BLOCKED_UNTIL - time.time()
@@ -268,7 +293,7 @@ def record_command():
             noise_rms = float(np.percentile([f[0] for f in calibration], 75))
         else:
             noise_rms = float(MIN_VOICE_THRESHOLD)
-        threshold = max(MIN_VOICE_THRESHOLD, noise_rms * NOISE_MULTIPLIER)
+        threshold = max(min_threshold, noise_rms * multiplier)
         print(f"Microphone ready (threshold: {threshold:.0f})")
 
         while True:
@@ -292,7 +317,7 @@ def record_command():
                 else:
                     voice_blocks = 0
                     noise_rms += (features[0] - noise_rms) * NOISE_ADAPT_RATE
-                    threshold = max(MIN_VOICE_THRESHOLD, noise_rms * NOISE_MULTIPLIER)
+                    threshold = max(min_threshold, noise_rms * multiplier)
             else:
                 chunks.append(audio)
                 if speech:
@@ -302,7 +327,7 @@ def record_command():
                     if silent_blocks * BLOCK_SAMPLES / SAMPLE_RATE >= SILENCE_SECONDS:
                         break
 
-            if time.time() - beginning >= MAX_LISTEN_SECONDS:
+            if time.time() - beginning >= max_seconds:
                 break
 
     print()
@@ -319,14 +344,15 @@ def record_command():
     return sr.AudioData(recording.tobytes(), SAMPLE_RATE, 2)
 
 
-def listen():
+def listen(mode="command"):
     """Record and transcribe offline (Whisper), Google as fallback.
 
-    Never let a microphone/driver hiccup kill the background assistant.
+    mode='wake' uses a stricter, shorter recording so room noise is ignored.
+    Never let a microphone/driver hiccup kill the assistant.
     """
     global LAST_AUDIO_ERROR_LOG
     try:
-        audio_data = record_command()
+        audio_data = record_command(strict=(mode == "wake"))
         if audio_data is None:
             return None
 
@@ -365,7 +391,7 @@ def wait_for_wake_word(island=None):
                 raise StopRequested()
             # "sleep" is a no-op here - we are already asleep.
 
-        heard = listen()
+        heard = listen(mode="wake")
         if not heard:
             continue
         is_wake, remainder = wake_match(heard)

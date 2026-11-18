@@ -88,7 +88,7 @@ def tray_icon(on_sleep, on_stop):
         draw.ellipse((6, 6, 58, 58), fill="#101b48", outline="#355bff", width=3)
         draw.ellipse((18, 22, 27, 31), fill="#8cf8ff")
         draw.ellipse((37, 22, 46, 31), fill="#8cf8ff")
-        draw.arc((24, 34, 40, 50), start=200, extent=140, fill="#f7a7ff", width=4)
+        draw.arc((24, 34, 40, 50), start=200, end=340, fill="#f7a7ff", width=4)
         return image
 
     # pystray calls actions with (icon, item); wrap the zero-arg callbacks.
