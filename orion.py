@@ -53,6 +53,7 @@ STOP_WORDS = ["stop", "exit", "quit", "bye", "goodbye"]
 MAX_SILENT_TURNS = 3
 LAST_AUDIO_ERROR_LOG = 0.0
 OLLAMA_READY = False
+SILENT_MODE = False
 
 SINGLE_INSTANCE_MUTEX = None
 ISLAND: OrionIsland | None = None
@@ -353,11 +354,15 @@ def remember(history, role, text):
 # ============================================================
 
 def run_orion(island):
-    global OLLAMA_READY
+    global OLLAMA_READY, SILENT_MODE
     history = deque()
 
     while True:
-        island.hide()
+        if SILENT_MODE:
+            island.hide()
+        else:
+            # Keep the blue orb visible while idle when run interactively.
+            island.show("ORION SLEEPING", "Say hello Orion")
         # Silent by design: sleeping is logged, never spoken.
         packaging.log(f"STATE: sleeping (pid {os.getpid()})")
         wait_for_wake_word(island)
@@ -464,7 +469,11 @@ def reminder_fired():
 # ============================================================
 
 def main():
-    global ISLAND
+    global ISLAND, SILENT_MODE
+
+    # VS Code / normal run: the blue orb is visible. --silent is only used by
+    # the optional background launcher and keeps everything hidden.
+    SILENT_MODE = "--silent" in sys.argv
 
     if not ensure_single_instance():
         raise SystemExit(0)
@@ -482,16 +491,15 @@ def main():
     print("======================================")
     print()
 
-    if "--autostart" in sys.argv:
-        system_control.set_autostart(True)
-        print("Autostart enabled.")
+    # Orion does not start at login by default; you launch it from VS Code.
     if "--no-autostart" in sys.argv:
         system_control.set_autostart(False)
-        print("Autostart disabled.")
     print("Autostart:", "ON" if packaging.is_autostart_enabled() else "OFF")
 
     ISLAND = OrionIsland()
     ISLAND.start()
+    if not SILENT_MODE:
+        ISLAND.show("ORION", "Ready - say hello Orion")
 
     scheduler_manager = Scheduler()
     scheduler_manager.on_fire(reminder_fired())

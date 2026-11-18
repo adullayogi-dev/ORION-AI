@@ -24,7 +24,7 @@ Else
     pythonExe = "pythonw.exe"
 End If
 
-command = """" & pythonExe & """ """ & project & "\orion.py"""
+command = """" & pythonExe & """ """ & project & "\orion.py"" --silent"
 
 Function OrionRunning()
     Dim wmi, procs, proc
